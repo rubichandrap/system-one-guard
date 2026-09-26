@@ -67,8 +67,8 @@ def tool_of(row: dict) -> str:
 
 
 def risk_outcome(row: dict) -> str:
-    """Which ask this call produced. Both thresholds return `block`; they only change how
-    loudly the guard says so. `urgent` is the higher tier."""
+    """Which ask this call produced. Both thresholds return `approve`: the gate has no veto,
+    it only changes how loudly it asks. `urgent` is the higher tier."""
     risk = noul(row, "risk")
     limits = row.get("thresholds") or {}
     if risk is None:
@@ -147,10 +147,10 @@ def db_blocks(log_rows: list[dict], db_path: str) -> dict | None:
         return None
     counts = {
         "risk_urgent": con.execute(
-            "select count(*) from messages where content like '%as destructive or irreversible. Stopped.%'"
+            "select count(*) from messages where content like '%as destructive or irreversible. Run it?%'"
         ).fetchone()[0],
-        "risk_block": con.execute(
-            "select count(*) from messages where content like '%so it did not run.%'"
+        "risk_approve": con.execute(
+            "select count(*) from messages where content like '%irreversible. Run it?%'"
         ).fetchone()[0],
         "legacy_blocks": con.execute(
             "select count(*) from messages where content like '%rewrite as a safer, reversible step%'"

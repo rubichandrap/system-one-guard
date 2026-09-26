@@ -3,7 +3,7 @@
 judgment is needed, and nowhere else. Harness-neutral: this module is the whole API
 surface, and the Hermes plugin in __init__.py is one adapter over it.
 
-  pre_tool_call -> {"action": "block", ...}                  side-effect gate (enforced)
+  pre_tool_call -> {"action": "approve", ...}              side-effect gate (enforced)
   pre_verify    -> {"action": "continue", ...}             done-check (enforced)
 
 Design follows RLCDAlignBench (arXiv 2609.29429) and the TypeSafe field guide:
@@ -11,12 +11,12 @@ Design follows RLCDAlignBench (arXiv 2609.29429) and the TypeSafe field guide:
   * A Jev call happens only where its answer can change behavior. A per-turn plan that is
     injected as advisory text changed no behavior in 240 measured turns; the plan, route,
     and model-tier questions are gone.
-  * A score of 0.70 or above STOPS the action; it does not silently allow it. The block
-    message is written to the AGENT, naming the tool and its input, so the agent can
-    explain the need and the user can re-run it. Probability picks the gate, not the
-    outcome: the user still decides. Measured on 12 deliberately safe actions, 9 scored
-    at or above 0.70 (`rm -rf dist build` 0.84), so the gate is loud. Raise APPROVE_AT
-    or enrich the state before trusting it unattended.
+  * A score of 0.70 or above ASKS THE USER, it does not silently allow. `approve` routes to
+    the same human gate as a dangerous shell pattern, so the user gets a yes/no on the
+    actual command. This depends on `approvals.single_query_mode: deny` (the default): at
+    `deny` an unattended run is blocked rather than auto-approved, which is what stops a
+    scheduled or `-q` session from waving the action through. At `approve` the guard is
+    decoration -- Hermes auto-approves when nobody is there to answer.
   * Read-only tools are classified in code, not by a model. A state-changing tool is the
     only thing Jev ever sees, and it sees the user request too, because "destructive" is
     relational: it is only knowable next to what the user asked for.
@@ -298,7 +298,7 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
 
     if tool in GATE_TOOLS and _plan(session).get("pending_human_gate"):
         _remember(session, pending_human_gate=False)  # one gate per flagged turn
-        return {"action": "block",
+        return {"action": "approve",
                 "message": f"Jev flagged this turn's result: {tool} may only run with the user's "
                            "approval. Say so and they will re-run it."}
 
@@ -312,16 +312,15 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
     if risk is None:
         return {}  # unusable answer: stay advisory
     if risk >= URGENT_AT:
-        return {"action": "block",
+        return {"action": "approve",
                 "message": f"Jev rates this {risk:.2f} (>= {URGENT_AT:.2f}) as destructive or "
-                           f"irreversible. Stopped. The action is {tool} with input: "
-                           f"{clip(args, 400)}. Tell the user why you need it, and they will "
-                           f"re-run it."}
+                           f"irreversible. Run it? The action is {tool} with input: "
+                           f"{clip(args, 400)}. Say no, or name a safer step."}
     if risk >= APPROVE_AT:
-        return {"action": "block",
-                "message": f"Jev risk {risk:.2f} (>= {APPROVE_AT:.2f}): it looks destructive or "
-                           f"irreversible, so it did not run. The action is {tool} with input: "
-                           f"{clip(args, 400)}. Say it is safe and it will run."}
+        return {"action": "approve",
+                "message": f"Jev risk {risk:.2f} (>= {APPROVE_AT:.2f}): looks destructive or "
+                           f"irreversible. Run it? The action is {tool} with input: "
+                           f"{clip(args, 400)}. Say no, or name a safer step."}
     return {}
 
 
@@ -406,10 +405,10 @@ def self_test() -> int:
     assert on_pre_llm_call({"session_id": "s1", "extra": {"user_message": "clean up the old builds"}}) == {}
     assert on_pre_llm_call({"session_id": "s1", "extra": {"user_message": "  "}}) == {}
     assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.1)) == {}
-    assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.8))["action"] == "block"
-    # even a certain answer stops and names the action, so the agent can ask the user for it
+    assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.8))["action"] == "approve"
+    # even a certain answer asks rather than allows: the user decides, not the model
     loud = on_pre_tool_call(tool, ask=_scripted_ask(risk=0.99))
-    assert loud["action"] == "block" and "Stopped" in loud["message"], loud
+    assert loud["action"] == "approve" and "Run it?" in loud["message"], loud
     assert "rm -rf /tmp/build" in loud["message"], loud  # the human sees the actual action
     # the data guard reaches the model, and the request that defines "destructive" is in state
     seen: dict = {}
@@ -430,7 +429,7 @@ def self_test() -> int:
     assert on_pre_verify(verify, ask=_scripted_ask(done=0.95, stop=0.9))["action"] == "continue"
     # a flagged turn arms the real approval prompt on the next mutating tool, then disarms
     _STATE["s1"]["pending_human_gate"] = True
-    assert on_pre_tool_call({"session_id": "s1", "tool_name": "patch"}, ask=_scripted_ask())["action"] == "block"
+    assert on_pre_tool_call({"session_id": "s1", "tool_name": "patch"}, ask=_scripted_ask())["action"] == "approve"
     assert on_pre_tool_call({"session_id": "s1", "tool_name": "patch"},
                             ask=_scripted_ask()) == {}
 

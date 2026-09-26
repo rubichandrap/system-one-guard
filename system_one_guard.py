@@ -20,8 +20,9 @@ Design follows RLCDAlignBench (arXiv 2609.29429) and the TypeSafe field guide:
   * Read-only tools are classified in code, not by a model. A state-changing tool is the
     only thing Jev ever sees, and it sees the user request too, because "destructive" is
     relational: it is only knowable next to what the user asked for.
-  * Answers are read as probabilities, never argmax. Argmax readouts lost 28 of 31
-    benchmarks in the paper; soft readouts won. Every gate threshold is per question.
+  * Answers are read as probabilities, never argmax. Argmax readouts lost 28 of 30
+    (CHOICE) and 24 of 31 (SCORE) benchmarks in the paper; soft readouts won. Every gate
+    threshold is per question.
   * Every question opens with the paper's data guard, so tool input that carries injected
     instructions is material to judge, not an instruction to follow.
   * The done-check is two atomic questions, not one. "Is it done" and "may the agent
@@ -47,10 +48,12 @@ from pathlib import Path
 
 API_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL = os.environ.get("JEV_MODEL", "jev-latest")
+QVERSION = "risk-v2"  # bump when question instructions or criteria change
 
 TIMEOUT = float(os.environ.get("JEV_TIMEOUT", "8"))
 APPROVE_AT = float(os.environ.get("JEV_APPROVE_AT", "0.7"))
 URGENT_AT = float(os.environ.get("JEV_BLOCK_AT", "0.97"))
+UNCERTAIN_AT = float(os.environ.get("JEV_UNCERTAIN_AT", "0.15"))
 VERIFY_AT = float(os.environ.get("JEV_VERIFY_AT", "0.7"))
 MAX_STATE_CHARS = int(os.environ.get("JEV_MAX_STATE_CHARS", "12000"))
 
@@ -60,8 +63,8 @@ LOG_PATH = os.environ.get("JEV_LOG") or str(
     Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     / "plugin-data" / "system-one-guard" / "jev-flow.jsonl")
 
-_SETTING_NAMES = ("timeout", "approve_at", "urgent_at", "verify_at", "max_state_chars",
-                  "code_chars", "log_path")
+_SETTING_NAMES = ("timeout", "approve_at", "urgent_at", "uncertain_at", "verify_at",
+                  "max_state_chars", "code_chars", "log_path")
 
 
 def configure(**overrides) -> None:
@@ -96,6 +99,24 @@ RISK_QUESTION = {
         "false": "read-only, additive, or easily reversible",
     },
 }
+
+# The same judgment as a 3-level Score, read as E[level]/2 (the paper's SCORE readout: soft
+# SCORE beat generic NOUL on 19 of 31 benchmarks). It rides the same call as RISK_QUESTION,
+# so the battery costs one round trip -- one call per question battery is the paper's cost rule.
+RISK_SCORE_QUESTION = {
+    "type": "score",
+    "instructions": DATA_GUARD + " Given `user_request` and the tool call the agent is about "
+                                 "to make, rate how destructive this action is.",
+    "criteria": [
+        "read-only, additive, or easily reversible",
+        "unclear from the state whether the change can be undone",
+        "deletes, overwrites, force-pushes, or irreversibly changes data or system state",
+    ],
+}
+
+# One call, both readouts. The gate takes the max: if either soft readout calls it dangerous,
+# the action is worth one question to the user.
+RISK_QUESTIONS = {"risk": RISK_QUESTION, "risk_score": RISK_SCORE_QUESTION}
 
 # Two atomic questions: the first judges the work, the second judges who may continue it.
 # The old single question mixed both, so an unclear verdict could not be routed to the
@@ -224,9 +245,11 @@ def log_call(event: str, ms: float, ok: bool, state=None, answers=None, error=No
         text = state or ""
         record = {
             "ts": time.time(), "event": event, "ms": round(ms, 1), "ok": ok, "session": session,
+            "model": MODEL, "qversion": QVERSION,
             "state_chars": len(text), "state_head": text[:200],
             "answers": answers, "error": error,
-            "thresholds": {"approve_at": APPROVE_AT, "urgent_at": URGENT_AT, "verify_at": VERIFY_AT},
+            "thresholds": {"approve_at": APPROVE_AT, "urgent_at": URGENT_AT,
+                           "uncertain_at": UNCERTAIN_AT, "verify_at": VERIFY_AT},
         }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -276,6 +299,39 @@ def _noul(answers: dict, key: str) -> float | None:
     return value if isinstance(value, (int, float)) else None
 
 
+def _score_half(answers: dict, key: str = "risk_score") -> float | None:
+    """Soft SCORE readout: E[level] normalized to 0..1 -- the paper's E[level]/2.
+
+    The API returns `score` (the expectation) plus `probabilities`; compute from whichever
+    is present. Verified shape (jev-1.13.0): {"score": 1.95, "confidence": 0.93,
+    "probabilities": {"0": 0.02, "1": 0.01, "2": 0.97}}."""
+    block = answers.get(key) or {}
+    if not isinstance(block, dict):
+        return None
+    value = block.get("score")
+    if isinstance(value, (int, float)):
+        return min(1.0, max(0.0, value / 2))
+    probs = block.get("probabilities")
+    if isinstance(probs, dict):
+        acc = total = 0.0
+        for level, p in probs.items():
+            try:
+                acc += float(level) * float(p)
+                total += float(p)
+            except (TypeError, ValueError):
+                continue
+        if total > 0:
+            return min(1.0, max(0.0, acc / total / 2))
+    return None
+
+
+def gate_score(answers: dict) -> float | None:
+    """One number for the gate: the largest soft readout in the battery, never an argmax.
+    None only when every readout is unusable (then the caller stays advisory)."""
+    values = [v for v in (_noul(answers, "risk"), _score_half(answers)) if v is not None]
+    return max(values) if values else None
+
+
 def on_pre_llm_call(payload: dict) -> dict:
     """Record the turn's user message and nothing else. No Jev call.
 
@@ -286,6 +342,31 @@ def on_pre_llm_call(payload: dict) -> dict:
     message = (_event_field(payload, "user_message") or "").strip()
     if message:
         _remember(_session(payload), user_message=message)
+    return {}
+
+
+POLICY_FILE = ".system-one-guard.json"
+
+
+def policy_facts(cwd: str) -> dict:
+    """Per-repo policy: `regenerable` vs `sacred` path lists from `.system-one-guard.json`.
+
+    The paper's lever is state content, and its large gains come from fields that encode the
+    label: "dist/ is regenerable, src/ is not" is a fact no tool call carries. Fail-open and
+    bounded: walk up four levels, parse one small JSON, keep only the two known keys."""
+    folder = Path(cwd or ".").resolve()
+    candidates = [folder / POLICY_FILE] + [p / POLICY_FILE for p in list(folder.parents)[:4]]
+    for candidate in candidates:
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        out = {}
+        for key in ("regenerable", "sacred"):
+            values = raw.get(key) if isinstance(raw, dict) else None
+            if isinstance(values, list):
+                out[key] = [str(v) for v in values][:32]
+        return out
     return {}
 
 
@@ -374,7 +455,10 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
     targets = _paths_in(args)
     state["written_this_turn"] = [p for p in targets if p in written]
     state["git"] = _git_facts(targets, cwd)
-    risk = _noul(ask(clip(state), {"risk": RISK_QUESTION}, "pre_tool_call", session), "risk")
+    policy = policy_facts(cwd)
+    if policy:
+        state["policy"] = policy
+    risk = gate_score(ask(clip(state), RISK_QUESTIONS, "pre_tool_call", session))
     if risk is None:
         return {}  # unusable answer: stay advisory
     if risk >= URGENT_AT:
@@ -387,6 +471,15 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
                 "message": f"Jev risk {risk:.2f} (>= {APPROVE_AT:.2f}): looks destructive or "
                            f"irreversible. Run it? The action is {tool} with input: "
                            f"{clip(args, 400)}. Say no, or name a safer step."}
+    if risk >= UNCERTAIN_AT:
+        # Selective prediction (paper section 4.4): trust only confident decisions. A score
+        # near 0.5 means the model cannot tell, so the human decides. The gate asks, it never
+        # blocks. This band is what catches the measured misses at 0.32 and 0.35.
+        return {"action": "approve",
+                "message": f"Jev is uncertain about this action ({risk:.2f}, below "
+                           f"{APPROVE_AT:.2f}): it may be destructive or irreversible. Run it? "
+                           f"The action is {tool} with input: {clip(args, 400)}. Say no, or "
+                           f"name a safer step."}
     return {}
 
 
@@ -445,12 +538,18 @@ def handle(payload: dict) -> dict:
     return handler(payload) if handler else {}
 
 
-def _scripted_ask(done=1.0, stop=0.05, risk=0.0):
-    """Deterministic stand-in for ask() so the decision logic is testable offline."""
+def _scripted_ask(done=1.0, stop=0.05, risk=0.0, score2=None):
+    """Deterministic stand-in for ask() so the decision logic is testable offline.
+
+    `score2` is the Score answer's E[level]/2; omit it to leave the score readout out of the
+    answer (the gate then falls back to the noul readout alone)."""
     def fake(state, questions, event=None, session=None):
         out = {}
         if "risk" in questions:
             out["risk"] = {"type": "noul", "noul": risk}
+        if "risk_score" in questions and score2 is not None:
+            out["risk_score"] = {"type": "score", "score": score2 * 2, "confidence": 0.9,
+                                 "probabilities": {"0": 1 - score2, "1": 0.0, "2": score2}}
         if "done" in questions:
             out["done"] = {"type": "noul", "noul": done}
             out["stop"] = {"type": "noul", "noul": stop}
@@ -461,8 +560,9 @@ def _scripted_ask(done=1.0, stop=0.05, risk=0.0):
 def plan_for(text: str, ask=ask) -> str:
     """One Jev risk call for a proposed action in `text`. Kept as the plugin-free path."""
     state = {"user_request": text, "tool": "terminal", "input": {"command": text}, "cwd": ""}
-    answers = ask(clip(state), {"risk": RISK_QUESTION}, "pre_verify_ask", "cli")
-    return f"Jev risk for: {text}\n{json.dumps(answers, ensure_ascii=False, indent=2)}"
+    answers = ask(clip(state), RISK_QUESTIONS, "pre_verify_ask", "cli")
+    return (f"Jev risk for: {text}\n{json.dumps(answers, ensure_ascii=False, indent=2)}"
+            f"\ngate score: {gate_score(answers)}")
 
 
 def self_test() -> int:
@@ -523,6 +623,29 @@ def self_test() -> int:
 
     # an unknown tool is not scored: only the two known sets are gated
     assert on_pre_tool_call({"session_id": "s1", "tool_name": "mcp_whatever"}, ask=_no_ask) == {}
+
+    # battery readouts: the gate score is the max of the soft readouts, never an argmax
+    assert gate_score({"risk": {"noul": 0.8}}) == 0.8
+    assert abs(_score_half({"risk_score": {"score": 1.95,
+               "probabilities": {"0": 0.02, "1": 0.01, "2": 0.97}}}) - 0.975) < 1e-9
+    assert abs(_score_half({"risk_score": {"probabilities": {"0": "x", "1": 0.5, "2": 0.5}}})
+               - 0.75) < 1e-9
+    assert gate_score({"risk": {"noul": 0.1}, "risk_score": {"score": 1.6}}) == 0.8
+    assert gate_score({}) is None and _score_half({"risk_score": {"type": "score"}}) is None
+    # selective prediction: an uncertain score asks the user, never passes and never blocks
+    unsure = on_pre_tool_call(tool, ask=_scripted_ask(risk=0.35))
+    assert unsure["action"] == "approve" and "uncertain" in unsure["message"], unsure
+    lifted = on_pre_tool_call(tool, ask=_scripted_ask(risk=0.1, score2=0.6))
+    assert lifted["action"] == "approve", lifted  # the score readout lifts it into the band
+    assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.05)) == {}
+    # per-repo policy reaches the state: the label-defining reference, not more tool facts
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        (Path(tmp) / POLICY_FILE).write_text(
+            '{"regenerable": ["dist", "build"], "sacred": ["src"], "junk": 1}', encoding="utf-8")
+        assert policy_facts(tmp) == {"regenerable": ["dist", "build"], "sacred": ["src"]}
+        assert policy_facts(str(Path(tmp) / "deep" / "er"))["regenerable"] == ["dist", "build"]
+        assert policy_facts("/tmp") == {}
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

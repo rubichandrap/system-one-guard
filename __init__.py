@@ -58,6 +58,7 @@ def register(ctx):
         timeout=ctx.get_config("timeout", default=system_one_guard.TIMEOUT),
         approve_at=ctx.get_config("approve_at", default=system_one_guard.APPROVE_AT),
         block_at=ctx.get_config("block_at", default=system_one_guard.URGENT_AT),
+        uncertain_at=ctx.get_config("uncertain_at", default=system_one_guard.UNCERTAIN_AT),
         verify_at=ctx.get_config("verify_at", default=system_one_guard.VERIFY_AT),
         code_chars=ctx.get_config("code_chars", default=system_one_guard.CODE_CHARS),
         max_state_chars=ctx.get_config("max_state_chars", default=system_one_guard.MAX_STATE_CHARS),

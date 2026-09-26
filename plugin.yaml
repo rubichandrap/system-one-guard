@@ -1,5 +1,5 @@
 name: system-one-guard
-version: 0.5.0
+version: 0.6.0
 description: Jev (TypeSafe System One) gates state-changing tool calls and done-checks, nothing else
 author: Rubi Chandraputra
 license: MIT
@@ -18,6 +18,7 @@ requires_env:
 config_schema:
   timeout: {type: float, default: 8, description: HTTP timeout in seconds for Jev calls}
   approve_at: {type: float, default: 0.7, description: Risk probability that escalates a tool call to human approval; also the bar for the done-check's stop question}
+  uncertain_at: {type: float, default: 0.15, description: Risk gate floor. At or above it the gate asks the user; below it passes. Scores in the uncertain band between this and approve_at ask with softer wording. Never a veto}
   block_at: {type: float, default: 0.97, description: Risk probability at which the ask becomes urgent and names the exact action. Still an approval prompt, never a veto: the gate has no power to deny an action the user wants. Config name kept for compatibility; read as urgent_at in code}
   verify_at: {type: float, default: 0.7, description: Nudge the agent to finish when p(complete) falls below this}
   code_chars: {type: int, default: 8000, description: Edited-file text sent with the done-check, in characters}

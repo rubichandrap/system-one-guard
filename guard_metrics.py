@@ -77,6 +77,8 @@ def risk_outcome(row: dict) -> str:
         return "urgent"
     if risk >= (limits.get("approve_at") or 1):
         return "approve"
+    if risk >= (limits.get("uncertain_at") or 0.3):
+        return "uncertain"
     return "pass"
 
 
@@ -209,6 +211,57 @@ def default_db_path() -> str:
     return str(Path(home) / "state.db")
 
 
+def calibrate(paths: list[str]) -> int:
+    """Sweep gate thresholds over labelled rows. The paper's remedy for ECE 0.168: a ranking
+    that is good is not a threshold, so place it on your own labels.
+
+    Each row needs a score (`risk` or `score`) and a label: `want` ("ask"/"pass") or
+    `expect_approve` (bool). `ab.py` writes exactly this shape. Prints the sweep and the
+    threshold with the fewest misses, then the fewest questions."""
+    cases = []
+    for path in paths:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        try:  # ab.py writes a JSON array; hand labels are usually JSONL
+            data = json.loads(text)
+            rows = data if isinstance(data, list) else []
+        except ValueError:
+            rows = load(path)
+        for row in rows:
+            score = row.get("risk")
+            if not isinstance(score, (int, float)):
+                score = row.get("score")
+            want = row.get("want")
+            if want not in ("ask", "pass"):
+                want = "ask" if row.get("expect_approve") else "pass"
+            if isinstance(score, (int, float)):
+                cases.append((float(score), want, str(row.get("id") or "?")))
+    if not cases:
+        print("no labelled rows with a score found")
+        return 1
+    threats = [c for c in cases if c[1] == "ask"]
+    safe = [c for c in cases if c[1] == "pass"]
+    print(f"labels: {len(cases)}  threats: {len(threats)}  safe: {len(safe)}")
+    print(f"{'t':>5}  {'caught':>6} {'missed':>6} {'false-asks':>10}  {'asks/real':>9}")
+    best = None
+    for step in range(5, 100, 5):
+        t = step / 100
+        caught = [c for c in threats if c[0] >= t]
+        missed = [c for c in threats if c[0] < t]
+        false = [c for c in safe if c[0] >= t]
+        per_real = (len(caught) + len(false)) / len(caught) if caught else float("inf")
+        print(f"{t:>5.2f}  {len(caught):>6} {len(missed):>6} {len(false):>10}  {per_real:>9.2f}")
+        key = (len(missed), len(false) + len(caught), -t)  # ties go to the strictest gate
+        if best is None or key < best[0]:
+            best = (key, t, missed, false)
+    _, t, missed, false = best
+    print(f"\nrecommended approve_at={t:.2f}  (fewest misses, then fewest questions, then strictest)")
+    for c in missed:
+        print(f"  missed: {c[2]} at {c[0]:.2f}")
+    for c in false:
+        print(f"  false ask: {c[2]} at {c[0]:.2f}")
+    return 0
+
+
 def self_test() -> int:
     rows = [
         {"event": "pre_tool_call", "ok": True, "ms": 800.0, "session": "a",
@@ -224,10 +277,18 @@ def self_test() -> int:
     ]
     s = summarize(rows)
     assert s["risk"]["approve"] == 1 and s["risk"]["pass"] == 1
+    assert risk_outcome({"answers": {"risk": {"noul": 0.35}},
+                         "thresholds": {"approve_at": 0.7, "uncertain_at": 0.3}}) == "uncertain"
     assert s["risk_by_tool"]["terminal"]["max"] == 0.8
     assert s["done_p"]["p50"] == 0.4 and s["stop_armed"] == 1
     assert s["events"]["pre_verify"]["failed"] == 1
     assert s["turns"][0]["calls"] == 4 and s["turns"][0]["gates"]["approve"] == 1
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "labels.jsonl"
+        f.write_text('{"id": "a", "risk": 0.9, "want": "ask"}\n'
+                     '{"id": "b", "risk": 0.1, "want": "pass"}\n', encoding="utf-8")
+        assert calibrate([str(f)]) == 0
     print("self-test OK")
     return 0
 
@@ -240,9 +301,13 @@ def main(argv: list[str]) -> int:
                         help="Hermes state.db for the enforcement count; '' to skip")
     parser.add_argument("--json", action="store_true", help="dump the summary as JSON")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--calibrate", nargs="+", metavar="LABELS",
+                        help="sweep gate thresholds over labelled rows (ab.py output)")
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.calibrate:
+        return calibrate(args.calibrate)
     if args.json:
         print(json.dumps(summarize(load(args.log)), default=str, indent=2))
         return 0

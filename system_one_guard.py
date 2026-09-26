@@ -472,19 +472,19 @@ def main(argv: list[str]) -> int:
         try:
             print(plan_for(text))
         except Exception as exc:
-            print(f"jev-guard: ask failed: {exc}", file=sys.stderr)
+            print(f"system-one-guard: ask failed: {exc}", file=sys.stderr)
             return 1
         return 0
     try:
         payload = json.load(sys.stdin)
     except Exception as exc:
-        print(f"jev-guard: unreadable payload: {exc}", file=sys.stderr)
+        print(f"system-one-guard: unreadable payload: {exc}", file=sys.stderr)
         return 0
     event = payload.get("hook_event_name")
     try:
         directive = handle(payload)
     except Exception as exc:  # fail open; the hook must never wedge the agent loop
-        print(f"jev-guard: {event} failed open: {exc}", file=sys.stderr)
+        print(f"system-one-guard: {event} failed open: {exc}", file=sys.stderr)
         return 0
     if directive:
         print(json.dumps(directive))

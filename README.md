@@ -4,9 +4,10 @@ A guard for coding agents: TypeSafe [Jev](https://typesafe.ai) (a System One mod
 for calibrated decisions) answers one narrow question before every state-changing tool call,
 and two more before the agent calls the turn done. Stdlib only, fail-open by default.
 
-The decision layer is a separate, harness-neutral core. This repository ships the Hermes
-adapter; the same `system_one_guard.py` runs as a shell hook, a standalone CLI, or inside
-another harness's hook API.
+The decision layer is `system_one_guard.py`: stdlib only, no harness imports, two entry
+points. This repository ships the Hermes adapter; the same file is a shell hook for other
+harnesses, a library, and a CLI. See
+[Integrate with a harness](#integrate-with-a-harness).
 
 ## Design follows the paper
 
@@ -80,18 +81,22 @@ Two Jev calls per code turn at most: one per state-changing tool call, one done-
 Read-only tools cost nothing. Tune the thresholds on your own labels — a gate that never
 fires on your traffic is untested, not safe.
 
+## Before you install
+
+You need a `TYPESAFE_API_KEY` from [typesafe.ai](https://typesafe.ai). It reads
+`$TYPESAFE_API_KEY` from the environment; Hermes loads it from `~/.hermes/.env` at startup.
+
+**Payload text leaves your machine.** User messages, tool inputs, final responses, and the
+text of files edited during a turn are sent to `api.typesafe.ai`. Enable this only on sessions
+whose content may leave the machine.
+
 ## Install
 
 ```bash
 hermes plugins install rubichandrap/system-one-guard
 ```
 
-Install prompts to enable the plugin and to store `TYPESAFE_API_KEY` in `~/.hermes/.env` when it
-is missing. `/plugins` shows it loaded; the hooks fire from then on.
-
-Payload text (user messages, tool inputs, final responses, and the text of files edited during a
-turn) is sent to `api.typesafe.ai` — enable this only on sessions whose content may leave the
-machine.
+Other harnesses: see [Integrate with a harness](#integrate-with-a-harness) below.
 
 ## Settings
 
@@ -111,22 +116,96 @@ Tool selection is a plain set of tool names in `system_one_guard.py` (`READ_ONLY
 `STATE_CHANGING`). The old `risk_tools`, `force_lane`, and `refactor_at` settings are gone;
 delete them from `config.yaml` if they are still there.
 
-## Without Hermes
+## Integrate with a harness
 
-`system_one_guard.py` runs standalone, so the decision layer is not tied to one harness:
+The decision layer is `system_one_guard.py` and nothing else. It has two entry points:
 
-- **Shell hooks** — append the block from [hooks.example.yaml](hooks.example.yaml) to
-  `~/.hermes/config.yaml`, then dry-run one event with
-  `hermes hooks test pre_tool_call --for-tool terminal`.
-- **On demand** — `python3 system_one_guard.py --ask "rm -rf the build output in ~/foo"`
-  prints Jev's calibrated risk for that action. [skill/SKILL.md](skill/SKILL.md) teaches an
-  agent when to use it and how to call the API directly; install it with
-  `hermes skills install https://raw.githubusercontent.com/rubichandrap/system-one-guard/main/skill/SKILL.md`.
-  A skill cannot enforce anything — no blocking, no approval gate — so it is advice, not guardrails.
-- **Another harness** — `handle(payload)` takes a hook payload dict and returns a directive
-  dict, and `ask(state, questions, event, session)` is the whole API surface. Bind those two
-  functions to whatever before/after-tool hooks the host provides; the questions, thresholds,
-  and state construction are already harness-independent.
+| Function | Input | Output |
+| --- | --- | --- |
+| `ask(state, questions, event, session)` | a state (str or JSON) plus typed questions | `{"answers": {...}}` with probabilities |
+| `handle(payload)` | a hook payload dict | `{}` or `{"action": "approve"\|"continue", "message": str}` |
+
+Both are plain functions with no Hermes import, so a harness adapter is a translation layer:
+map your event to a payload, call `handle`, and honour `action`. A hook that wants to enforce
+must be able to prompt the user; a hook that cannot can still call `ask()` and use the score
+advisorily, which is what the skill below does.
+
+### Hermes Agent
+
+```bash
+hermes plugins install rubichandrap/system-one-guard
+```
+
+Registers `pre_llm_call`, `pre_tool_call`, and `pre_verify`. The plugin in `__init__.py` is
+that adapter already. Restart Hermes after installing.
+
+### Any harness with a pre-tool hook (Claude Code, Codex, Copilot, Cursor, OpenCode)
+
+The script speaks the common shape — a JSON payload on stdin, one JSON directive on stdout,
+exit 0 always. Point your harness's before-tool hook at it:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "terminal|write_file|patch|delete_file",
+        "hooks": [
+          { "type": "command", "command": "python3 /path/to/system_one_guard.py", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Translate your event into the payload `handle()` expects:
+
+| Field | Meaning |
+| --- | --- |
+| `hook_event_name` | `"pre_tool_call"` or `"pre_verify"` |
+| `tool_name` | the tool being called |
+| `tool_input` | its arguments as a dict |
+| `session_id` | anything stable per conversation |
+| `extra.user_message` | the turn's user message (`pre_verify` only) |
+| `extra.final_response` | the turn's final text (`pre_verify` only) |
+| `extra.changed_paths` | files edited this turn (`pre_verify` only) |
+
+Example payload:
+
+```json
+{
+  "hook_event_name": "pre_tool_call",
+  "tool_name": "terminal",
+  "tool_input": { "command": "rm -rf /tmp/build" },
+  "session_id": "abc123"
+}
+```
+
+Rules that matter when writing an adapter:
+
+- **`action: "approve"` is a question, not a refusal.** Show the message to the user and let
+  them decide. There is no `block` action, by design.
+- **A missing Jev answer must stay advisory.** If the call times out or the payload is
+  unparseable, `handle()` returns `{}` and the tool proceeds. Do not treat silence as denial.
+- **Never pass secrets.** The state is sent to `api.typesafe.ai`.
+
+### Harnesses with no pre-tool hook
+
+Use it as a library and call `ask()` from whatever the host exposes (a middleware, a
+subagent-start hook, a slash command). The questions in `RISK_QUESTION` and `DONE_QUESTIONS`
+are importable constants, so you can compose your own without copying the wording.
+
+### On demand, in any harness
+
+```bash
+python3 system_one_guard.py --ask "rm -rf the build output in ~/foo"
+```
+
+Prints Jev's calibrated risk for that action. [skill/SKILL.md](skill/SKILL.md) teaches an
+agent when to use it and how to call the API directly; install it with
+`hermes skills install https://raw.githubusercontent.com/rubichandrap/system-one-guard/main/skill/SKILL.md`.
+A skill cannot enforce anything — no approval gate — so it is advice, not guardrails.
 
 ## Development
 

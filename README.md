@@ -40,11 +40,16 @@ detection, not enforcement, and it does not claim a threshold transfers between 
 | Hook | Jev call? | Decision |
 | --- | --- | --- |
 | `pre_llm_call` | **no** | records the turn's user message for the risk state |
-| `pre_tool_call` | one `noul`, state-changing tools only | `block` / `approve` / pass, on P(destructive) |
+| `pre_tool_call` | one `noul`, state-changing tools only | asks you, on P(destructive) — never vetoes |
 | `pre_verify` | one call, two `noul` questions | nudge the agent to finish, or arm the human gate |
 
 A Jev call happens only where its answer can change behavior. Read-only tool names are
 classified in code. A Jev error or timeout logs a warning and the agent proceeds.
+
+**The gate asks; it does not refuse.** Even a 0.99 risk score returns an approval prompt
+naming the exact command, not a block. A calibrated probability is evidence, not authority,
+and refusing on a model's say-so is the same failure as allowing on a model's say-so. If you
+want the action, approve it. Nothing here can deny you something you asked for.
 
 ## Measurements
 
@@ -61,6 +66,11 @@ user:  Run exactly: rm -rf /tmp/jev-destroy-me && echo deleted
 Jev:   risk 0.90  -> approve -> Hermes blocked it (no approver present), file never created
        risk 0.10 on the `ls` in the same turn -> pass
 ```
+
+Those blocks were real, and they were also the design error this guard has since fixed: an
+unattended session could not say yes, so a high score read as a refusal. The gate now always
+asks. The scores were never wrong — `rm -rf` really is 0.89–0.93 and a directory listing
+really is 0.02–0.10 — but a score should size the question, not answer it.
 
 **Cost (the reason the rest was deleted).**
 
@@ -104,7 +114,7 @@ environment variables are the fallback defaults. Every threshold is per question
 | --- | --- | --- | --- |
 | `timeout` | `JEV_TIMEOUT` | `8` | HTTP timeout, seconds |
 | `approve_at` | `JEV_APPROVE_AT` | `0.7` | P(destructive) that escalates to human approval; also the bar for the done-check's `stop` question |
-| `block_at` | `JEV_BLOCK_AT` | `0.97` | P(destructive) that blocks the tool call |
+| `block_at` | `JEV_BLOCK_AT` | `0.97` | P(destructive) at which the ask becomes urgent and names the exact action. Still an approval prompt. Read as `URGENT_AT` in code; the config name is kept for compatibility |
 | `verify_at` | `JEV_VERIFY_AT` | `0.7` | nudge the agent to finish when P(complete) falls below this |
 | `code_chars` | `JEV_CODE_CHARS` | `8000` | edited-file text sent with the done-check, in characters |
 | `max_state_chars` | `JEV_MAX_STATE_CHARS` | `12000` | state sent to Jev is clipped to this |

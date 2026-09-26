@@ -3,14 +3,18 @@
 judgment is needed, and nowhere else. Harness-neutral: this module is the whole API
 surface, and the Hermes plugin in __init__.py is one adapter over it.
 
-  pre_tool_call -> {"action": "block"|"approve", ...}   side-effect gate (enforced)
-  pre_verify    -> {"action": "continue", ...}          done-check (enforced)
+  pre_tool_call -> {"action": "approve", ...}              side-effect gate (enforced)
+  pre_verify    -> {"action": "continue", ...}             done-check (enforced)
 
 Design follows RLCDAlignBench (arXiv 2609.29429) and the TypeSafe field guide:
 
   * A Jev call happens only where its answer can change behavior. A per-turn plan that is
     injected as advisory text changed no behavior in 240 measured turns; the plan, route,
     and model-tier questions are gone.
+  * The gate only ever ASKS. Even a 0.99 risk score returns `approve`, not `block`: a
+    calibrated probability is evidence, not authority, and refusing on its say-so is the
+    same error as allowing on its say-so. The user approves, or says no, or redirects.
+    Nothing here can deny an action the user wants.
   * Read-only tools are classified in code, not by a model. A state-changing tool is the
     only thing Jev ever sees, and it sees the user request too, because "destructive" is
     relational: it is only knowable next to what the user asked for.
@@ -43,7 +47,7 @@ MODEL = os.environ.get("JEV_MODEL", "jev-latest")
 
 TIMEOUT = float(os.environ.get("JEV_TIMEOUT", "8"))
 APPROVE_AT = float(os.environ.get("JEV_APPROVE_AT", "0.7"))
-BLOCK_AT = float(os.environ.get("JEV_BLOCK_AT", "0.97"))
+URGENT_AT = float(os.environ.get("JEV_BLOCK_AT", "0.97"))
 VERIFY_AT = float(os.environ.get("JEV_VERIFY_AT", "0.7"))
 MAX_STATE_CHARS = int(os.environ.get("JEV_MAX_STATE_CHARS", "12000"))
 
@@ -53,16 +57,20 @@ LOG_PATH = os.environ.get("JEV_LOG") or str(
     Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     / "plugin-data" / "system-one-guard" / "jev-flow.jsonl")
 
-_SETTING_NAMES = ("timeout", "approve_at", "block_at", "verify_at", "max_state_chars",
+_SETTING_NAMES = ("timeout", "approve_at", "urgent_at", "verify_at", "max_state_chars",
                   "code_chars", "log_path")
 
 
 def configure(**overrides) -> None:
     """Override module defaults; the plugin resolves these from config.yaml.
 
-    Env vars above stay the standalone default. Unknown keys are ignored.
+    Env vars above stay the standalone default. Unknown keys are ignored. `block_at` is the
+    config-file name for what the code now calls `URGENT_AT`: the tier is a louder ask, not
+    a veto, so the name kept is the one users already have in their config.
     """
+    aliases = {"block_at": "urgent_at"}
     for name, value in overrides.items():
+        name = aliases.get(name, name)
         if name in _SETTING_NAMES and value is not None:
             current = globals()[name.upper()]
             globals()[name.upper()] = type(current)(value)
@@ -215,7 +223,7 @@ def log_call(event: str, ms: float, ok: bool, state=None, answers=None, error=No
             "ts": time.time(), "event": event, "ms": round(ms, 1), "ok": ok, "session": session,
             "state_chars": len(text), "state_head": text[:200],
             "answers": answers, "error": error,
-            "thresholds": {"approve_at": APPROVE_AT, "block_at": BLOCK_AT, "verify_at": VERIFY_AT},
+            "thresholds": {"approve_at": APPROVE_AT, "urgent_at": URGENT_AT, "verify_at": VERIFY_AT},
         }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -301,14 +309,16 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
     risk = _noul(ask(clip(state), {"risk": RISK_QUESTION}, "pre_tool_call", session), "risk")
     if risk is None:
         return {}  # unusable answer: stay advisory
-    if risk >= BLOCK_AT:
-        return {"action": "block",
-                "message": f"Jev risk {risk:.2f} (>= {BLOCK_AT:.2f}): blocked; rewrite as a "
-                           "safer, reversible step."}
+    if risk >= URGENT_AT:
+        return {"action": "approve",
+                "message": f"Jev rates this {risk:.2f} (>= {URGENT_AT:.2f}) as destructive or "
+                           f"irreversible. It is asking, not refusing: if you want it done, approve "
+                           f"it. The action is {tool} with input: {clip(args, 400)}. Otherwise say "
+                           f"what safer step to take instead."}
     if risk >= APPROVE_AT:
         return {"action": "approve",
-                "message": f"Jev risk {risk:.2f} (>= {APPROVE_AT:.2f}): ask the user before "
-                           "running this."}
+                "message": f"Jev risk {risk:.2f} (>= {APPROVE_AT:.2f}): it wants your OK before "
+                           f"running this."}
     return {}
 
 
@@ -394,7 +404,10 @@ def self_test() -> int:
     assert on_pre_llm_call({"session_id": "s1", "extra": {"user_message": "  "}}) == {}
     assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.1)) == {}
     assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.8))["action"] == "approve"
-    assert on_pre_tool_call(tool, ask=_scripted_ask(risk=0.99))["action"] == "block"
+    # even a certain answer asks rather than refuses: the user decides, not the model
+    loud = on_pre_tool_call(tool, ask=_scripted_ask(risk=0.99))
+    assert loud["action"] == "approve" and "not refusing" in loud["message"], loud
+    assert "rm -rf /tmp/build" in loud["message"], loud  # the human sees the actual action
     # the data guard reaches the model, and the request that defines "destructive" is in state
     seen: dict = {}
 

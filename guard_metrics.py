@@ -67,12 +67,14 @@ def tool_of(row: dict) -> str:
 
 
 def risk_outcome(row: dict) -> str:
+    """Which ask this call produced. Both thresholds return `approve`: the gate has no veto,
+    it only changes how loudly it asks. `urgent` is the higher tier."""
     risk = noul(row, "risk")
     limits = row.get("thresholds") or {}
     if risk is None:
         return "?"
-    if risk >= (limits.get("block_at") or 1):
-        return "block"
+    if risk >= (limits.get("urgent_at") or limits.get("block_at") or 1):
+        return "urgent"
     if risk >= (limits.get("approve_at") or 1):
         return "approve"
     return "pass"
@@ -144,11 +146,14 @@ def db_blocks(log_rows: list[dict], db_path: str) -> dict | None:
     except sqlite3.Error:
         return None
     counts = {
-        "risk_block": con.execute(
-            "select count(*) from messages where content like '%rewrite as a safer, reversible step%'"
+        "risk_urgent": con.execute(
+            "select count(*) from messages where content like '%It is asking, not refusing%'"
         ).fetchone()[0],
         "risk_approve": con.execute(
-            "select count(*) from messages where content like '%ask the user before running this%'"
+            "select count(*) from messages where content like '%wants your OK before%'"
+        ).fetchone()[0],
+        "legacy_blocks": con.execute(
+            "select count(*) from messages where content like '%rewrite as a safer, reversible step%'"
         ).fetchone()[0],
         "done_nudge": con.execute(
             "select count(*) from messages where content like '%Finish%before stopping%'"
@@ -208,10 +213,10 @@ def self_test() -> int:
     rows = [
         {"event": "pre_tool_call", "ok": True, "ms": 800.0, "session": "a",
          "state_head": '{"tool": "terminal", "input": {"command": "rm -rf /tmp/x"}}',
-         "answers": {"risk": {"noul": 0.8}}, "thresholds": {"approve_at": 0.7, "block_at": 0.97}},
+         "answers": {"risk": {"noul": 0.8}}, "thresholds": {"approve_at": 0.7, "urgent_at": 0.97}},
         {"event": "pre_tool_call", "ok": True, "ms": 700.0, "session": "a",
          "state_head": '{"tool": "patch", "input": {"new_string": "x"}}',
-         "answers": {"risk": {"noul": 0.1}}, "thresholds": {"approve_at": 0.7, "block_at": 0.97}},
+         "answers": {"risk": {"noul": 0.1}}, "thresholds": {"approve_at": 0.7, "urgent_at": 0.97}},
         {"event": "pre_verify", "ok": True, "ms": 900.0, "session": "a",
          "answers": {"done": {"noul": 0.4}, "stop": {"noul": 0.95}}},
         {"event": "pre_verify", "ok": False, "ms": 100.0, "session": "a",

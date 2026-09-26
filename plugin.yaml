@@ -1,13 +1,13 @@
-name: hermes-jev-guard
-version: 0.4.0
-description: Jev (TypeSafe System One) plans each turn, gates tool risk, done-checks with a code-quality gate, and human-gates refactors
+name: system-one-guard
+version: 0.5.0
+description: Jev (TypeSafe System One) gates state-changing tool calls and done-checks, nothing else
 author: Rubi Chandraputra
 license: MIT
-homepage: https://github.com/rubichandrap/hermes-jev-guard
+homepage: https://github.com/rubichandrap/system-one-guard
 # manifest_version omitted: the current Hermes installer caps at 1; the loader parses config_schema either way
-tags: [guardrail, routing, typesafe, jev]
+tags: [guardrail, typesafe, jev]
 provides_hooks:
-  - pre_llm_call
+  - pre_llm_call   # records the turn's user message only; makes no Jev call
   - pre_tool_call
   - pre_verify
 requires_env:
@@ -17,14 +17,8 @@ requires_env:
     secret: true
 config_schema:
   timeout: {type: float, default: 8, description: HTTP timeout in seconds for Jev calls}
-  approve_at: {type: float, default: 0.7, description: Risk probability that escalates a tool call to human approval}
-  block_at: {type: float, default: 0.97, description: Risk probability that blocks a tool call}
-  verify_at: {type: float, default: 0.7, description: Done-check probability that nudges the agent to continue}
-  refactor_at: {type: float, default: 0.7, description: Confidence the code-quality gate needs to order a refactor; below it the user decides}
+  approve_at: {type: float, default: 0.7, description: Risk probability that escalates a tool call to human approval; also the bar for the done-check's stop question}
+  block_at: {type: float, default: 0.97, description: Risk probability that blocks the tool call}
+  verify_at: {type: float, default: 0.7, description: Nudge the agent to finish when p(complete) falls below this}
   code_chars: {type: int, default: 8000, description: Edited-file text sent with the done-check, in characters}
   max_state_chars: {type: int, default: 12000, description: State sent to Jev is clipped to this many characters}
-  economy_model: {type: str, default: "", description: Model id to use when Jev pitches the economy tier; empty disables the swap}
-  standard_model: {type: str, default: "", description: Model id to use when Jev pitches the standard tier; empty disables the swap}
-  frontier_model: {type: str, default: "", description: Model id to use when Jev pitches the frontier tier; empty disables the swap}
-  risk_tools: {type: str, default: "", description: Pipe-separated tools that get a Jev risk score; empty scores every tool}
-  force_lane: {type: str, default: "", description: Probability at which a delegating lane blocks the first direct tool call once; empty keeps lanes advisory}

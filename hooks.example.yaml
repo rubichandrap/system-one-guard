@@ -1,13 +1,15 @@
 # Append this to ~/.hermes/config.yaml. Hermes expands ~ in hook commands.
 hooks:
+  # Records the turn's user message. Makes no Jev call.
   pre_llm_call:
-    - command: "python3 ~/hermes-jev-guard/jev_guard.py"
+    - command: "python3 ~/system-one-guard/system_one_guard.py"
       timeout: 10
+  # Read-only tools (read_file, web_search, web_extract, browser_exec, search_files) are
+  # classified in code and never reach Jev. Everything else in the state-changing set is asked.
   pre_tool_call:
-    - matcher: "terminal|write_file|patch"
-      command: "python3 ~/hermes-jev-guard/jev_guard.py"
+    - command: "python3 ~/system-one-guard/system_one_guard.py"
       timeout: 10
       # fail_closed: true  # block the tool call when Jev is unreachable or times out
   pre_verify:
-    - command: "python3 ~/hermes-jev-guard/jev_guard.py"
+    - command: "python3 ~/system-one-guard/system_one_guard.py"
       timeout: 10

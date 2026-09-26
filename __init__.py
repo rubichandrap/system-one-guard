@@ -1,14 +1,20 @@
-"""Hermes plugin: Jev (TypeSafe System One) route hint, tool-risk gate, done-check.
+"""Hermes plugin: Jev (TypeSafe System One) behind the tool-risk gate and the done-check.
 
-Thin adapter — the decision logic lives in ``jev_guard.py``, which also runs
-standalone as a shell hook (see README). Hooks fail open: an exception is
-logged and the agent proceeds.
+Thin adapter — the decision logic lives in ``system_one_guard.py``, which also runs
+standalone as a shell hook (see README). Hooks fail open: an exception is logged
+and the agent proceeds.
+
+``pre_llm_call`` is registered for one reason: it is the only hook that carries the turn's
+user message, and the risk gate needs it. It makes no Jev call. A previous version asked
+Jev for a route, a lane, a complexity, and a model tier here; the measured plan text was
+ignored 4 times out of 4, and a mid-conversation model swap breaks the prompt cache, so
+all of that is gone.
 """
 from __future__ import annotations
 
 import logging
 
-from . import jev_guard
+from . import system_one_guard
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +23,7 @@ _TOP_LEVEL = ("tool_name", "args", "session_id", "cwd", "profile")
 
 
 def _as_payload(event: str, kwargs: dict) -> dict:
-    """Map plugin-hook kwargs onto the payload shape jev_guard.handle() expects."""
+    """Map plugin-hook kwargs onto the payload shape system_one_guard.handle() expects."""
     return {
         "hook_event_name": event,
         "tool_name": kwargs.get("tool_name"),
@@ -32,37 +38,29 @@ def _as_payload(event: str, kwargs: dict) -> dict:
 def _make_hook(event: str):
     def hook(**kwargs):
         try:
-            return jev_guard.handle(_as_payload(event, kwargs)) or None
+            return system_one_guard.handle(_as_payload(event, kwargs)) or None
         except Exception:  # fail open, same policy as the standalone script
             logger.warning("jev-guard: %s failed open", event, exc_info=True)
             return None
 
-    hook.__name__ = f"jev_guard_{event}"
+    hook.__name__ = f"system_one_guard_{event}"
     return hook
 
 
 def register(ctx):
-    """Resolve settings, then register the hooks and the model-tier middleware."""
+    """Resolve settings, then register the two gate hooks and the message recorder."""
     try:  # profile-scoped flow log; older loaders without ctx.state keep the default path
         log_path = str(ctx.state.data_dir / "jev-flow.jsonl")
     except AttributeError:
-        log_path = jev_guard.LOG_PATH
-    jev_guard.configure(
+        log_path = system_one_guard.LOG_PATH
+    system_one_guard.configure(
         log_path=log_path,
-        timeout=ctx.get_config("timeout", default=jev_guard.TIMEOUT),
-        approve_at=ctx.get_config("approve_at", default=jev_guard.APPROVE_AT),
-        block_at=ctx.get_config("block_at", default=jev_guard.BLOCK_AT),
-        verify_at=ctx.get_config("verify_at", default=jev_guard.VERIFY_AT),
-        refactor_at=ctx.get_config("refactor_at", default=jev_guard.REFACTOR_AT),
-        code_chars=ctx.get_config("code_chars", default=jev_guard.CODE_CHARS),
-        max_state_chars=ctx.get_config("max_state_chars", default=jev_guard.MAX_STATE_CHARS),
-        economy_model=ctx.get_config("economy_model", default=jev_guard.ECONOMY_MODEL),
-        standard_model=ctx.get_config("standard_model", default=jev_guard.STANDARD_MODEL),
-        frontier_model=ctx.get_config("frontier_model", default=jev_guard.FRONTIER_MODEL),
-        risk_tools=ctx.get_config("risk_tools", default=jev_guard.RISK_TOOLS),
-        force_lane=ctx.get_config("force_lane", default=jev_guard.FORCE_LANE),
+        timeout=ctx.get_config("timeout", default=system_one_guard.TIMEOUT),
+        approve_at=ctx.get_config("approve_at", default=system_one_guard.APPROVE_AT),
+        block_at=ctx.get_config("block_at", default=system_one_guard.BLOCK_AT),
+        verify_at=ctx.get_config("verify_at", default=system_one_guard.VERIFY_AT),
+        code_chars=ctx.get_config("code_chars", default=system_one_guard.CODE_CHARS),
+        max_state_chars=ctx.get_config("max_state_chars", default=system_one_guard.MAX_STATE_CHARS),
     )
     for event in _EVENTS:
         ctx.register_hook(event, _make_hook(event))
-    # Rewrites the model per request when a tier model is configured; no-op otherwise.
-    ctx.register_middleware("llm_request", jev_guard.on_llm_request)

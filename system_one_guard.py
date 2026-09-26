@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -288,6 +289,64 @@ def on_pre_llm_call(payload: dict) -> dict:
     return {}
 
 
+def _git_facts(paths: list[str], cwd: str) -> dict:
+    """Regenerable / tracked / ignored, from git itself. The paper's finding is that state
+    content moves the number and question wording does not; these three fields are the
+    facts that separate `rm -rf dist` from `rm -rf src`. Bounded and fail-open: any git
+    failure returns {} and the guard scores what it already had."""
+    out: dict = {}
+    repo = _git(cwd, "rev-parse", "--is-inside-work-tree")
+    if repo is None:
+        return out
+    for label, cmd in (("tracked", "ls-files"), ("ignored", "check-ignore")):
+        got = _git(cwd, cmd, *paths) if paths else None
+        if got is None:
+            continue
+        if cmd == "ls-files":
+            # `ls-files -- <path>` prefixes each line with a status letter (H, M, ...).
+            got = {line.split(None, 1)[-1] for line in got}
+        out[label] = sorted(got)
+    return out
+
+
+def _git(cwd: str, *args: str) -> set[str] | None:
+    """Run one git command; None on any failure. `check-ignore` exits 1 when nothing
+    matches, which is an answer, not an error."""
+    try:
+        done = subprocess.run(["git", *args], cwd=cwd or ".", capture_output=True,
+                              text=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode not in (0, 1):
+        return None
+    return {line.strip() for line in done.stdout.splitlines() if line.strip()}
+
+
+_PATH_RE = re.compile(r"[\w./~$-]{2,}")
+# Bare words like `dist` or `build` are the common case and were being dropped, which
+# silently disabled every git fact. Treat any rm/mv/glob argument as a path candidate.
+_VERB_RE = re.compile(r"\b(rm|mv|rmdir|unlink|shred|truncate|chmod|chown)\b|\*|\?")
+_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+
+
+def _paths_in(args) -> list[str]:
+    """Best-effort path-ish tokens from a tool call. Deliberately dumb: a wrong guess here
+    only adds a useless field, and the guard still has everything it had before."""
+    if not isinstance(args, dict):
+        return []
+    blob = " ".join(str(v) for v in args.values() if isinstance(v, (str, int, float)))
+    destructive = bool(_VERB_RE.search(blob))
+    found = []
+    for token in _PATH_RE.findall(blob):
+        # Flags (`-rf`, `--`) are not paths, and passing one to git makes it reject the
+        # whole call, which silently empties every fact.
+        if token.startswith("-"):
+            continue
+        if "/" in token or _EXT_RE.search(token) or destructive:
+            found.append(token)
+    return found[:12]
+
+
 def on_pre_tool_call(payload: dict, ask=ask) -> dict:
     session = _session(payload)
     tool = (payload.get("tool_name") or "").strip()
@@ -302,12 +361,19 @@ def on_pre_tool_call(payload: dict, ask=ask) -> dict:
                 "message": f"Jev flagged this turn's result: {tool} may only run with the user's "
                            "approval. Say so and they will re-run it."}
 
+    cwd = payload.get("cwd") or ""
     state = {
         "user_request": _plan(session).get("user_message", ""),
         "tool": tool,
         "input": args,
-        "cwd": payload.get("cwd") or "",
+        "cwd": cwd,
     }
+    # State content, not question wording, is what moves the score (arXiv 2609.29429).
+    # These are the facts the model cannot infer from the command string alone.
+    written = _plan(session).get("written_paths") or []
+    targets = _paths_in(args)
+    state["written_this_turn"] = [p for p in targets if p in written]
+    state["git"] = _git_facts(targets, cwd)
     risk = _noul(ask(clip(state), {"risk": RISK_QUESTION}, "pre_tool_call", session), "risk")
     if risk is None:
         return {}  # unusable answer: stay advisory
@@ -330,6 +396,10 @@ def on_pre_verify(payload: dict, ask=ask) -> dict:
     if not response:
         return {}
     changed = _event_field(payload, "changed_paths") or []
+    if changed:
+        # The next turn's risk state needs to know what the agent itself created, so
+        # deleting its own scratch file is not scored like deleting the user's work.
+        _remember(session, written_paths=[str(p) for p in changed][-50:])
     state = {"user_message": _plan(session).get("user_message", ""),
              "final_response": response,
              "changed_paths": changed}
@@ -410,6 +480,13 @@ def self_test() -> int:
     loud = on_pre_tool_call(tool, ask=_scripted_ask(risk=0.99))
     assert loud["action"] == "approve" and "Run it?" in loud["message"], loud
     assert "rm -rf /tmp/build" in loud["message"], loud  # the human sees the actual action
+    # git facts are additive and fail-open: a non-repo cwd must not break the gate
+    assert _git_facts(["dist"], "/tmp") == {} or "tracked" not in _git_facts(["dist"], "/tmp")
+    got = _paths_in({"command": "rm -rf build/dist a.log"})
+    assert {"build/dist", "a.log"} <= set(got), got
+    assert "dist" in _paths_in({"command": "rm -rf dist build .next"}), "bare dir names count"
+    assert _paths_in({"old_string": "hello world"}) == []
+    assert _paths_in("not a dict") == []
     # the data guard reaches the model, and the request that defines "destructive" is in state
     seen: dict = {}
 

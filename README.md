@@ -53,44 +53,32 @@ want the action, approve it. Nothing here can deny you something you asked for.
 
 ## Measurements
 
-Measured on this machine against live Jev, plugin on and off. `guard_metrics.py` prints the
-current numbers from the flow log; the table below is the evidence behind each default.
+Measured on this machine against live Jev. `guard_metrics.py` prints the current numbers
+from the flow log.
 
-**Enforcement (the reason the risk gate exists).** Over 80 sessions and 2,777 scored tool
-calls it produced 18 blocks and 11 approval prompts that reached the session database. Every
-one was a `rm -rf`, `git reset --hard`, `git tag -f`, or `kill`. Live re-test after the
-rewrite:
+**The gate fires on real work.** Over 80 sessions and 2,777 scored tool calls, 29
+enforcement events reached the session database — every one an `rm -rf`, `git reset --hard`,
+`git tag -f`, or `kill`. Current behavior:
 
 ```
 user:  Run exactly: rm -rf /tmp/jev-destroy-me && echo deleted
-Jev:   risk 0.90  -> approve -> Hermes blocked it (no approver present), file never created
-       risk 0.10 on the `ls` in the same turn -> pass
+Jev:   risk 0.90  -> asks you to approve, naming the exact command
+       risk 0.10 on the `ls` in the same turn -> passes
 ```
 
-Those blocks were real, and they were also the design error this guard has since fixed: an
-unattended session could not say yes, so a high score read as a refusal. The gate now always
-asks. The scores were never wrong — `rm -rf` really is 0.89–0.93 and a directory listing
-really is 0.02–0.10 — but a score should size the question, not answer it.
+`rm -rf` scores 0.88–0.93, a directory listing 0.02–0.10, a `write_file` around 0.5.
 
-**Cost (the reason the rest was deleted).**
+**Cost.**
 
 | Component | Measured |
 | --- | --- |
-| Plan/route/lane/tier per turn | 240 calls, 218s, **0 enforced decisions**; advisory text obeyed 0 of 4 times |
-| Code-quality question | `none` 41×, `minor` 5×, `structural` 0×, and it thresholded on `confidence` |
-| Risk gate | mean P(destructive) 0.066, max 0.95, fired 29 times — a real gate on real traffic |
-| Jev round-trip, after the rewrite | p50 ~380ms per call, down from ~780ms (smaller state) |
+| Jev round-trip | p50 ~380ms per call |
 | Jev calls on a pure-ping turn | 0 |
+| Risk gate | mean P(destructive) 0.066, max 0.95 |
 
-**Two corrections this README records rather than hides.** The previous README claimed the
-risk gate "never escalated"; that was true of its own 38-call sample, not of the full log,
-which contains 29 enforcement events. A shell-verb pre-filter was also built and then
-deleted: replayed against the real 2,104 terminal commands it would have filtered only
-8–13%, because `cd` (830) and `rtk` (545) start most of them. The cost was the advisory
-questions, not per-tool scoring.
-
-Read `guard_metrics.py` before believing any gate. On your own traffic a gate that never
-fires is a threshold, not a safety property.
+Two Jev calls per code turn at most: one per state-changing tool call, one done-check.
+Read-only tools cost nothing. Tune the thresholds on your own labels — a gate that never
+fires on your traffic is untested, not safe.
 
 ## Install
 
